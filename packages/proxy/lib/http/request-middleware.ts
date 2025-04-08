@@ -10,6 +10,7 @@ import { doesTopNeedToBeSimulated } from './util/top-simulation'
 
 import type { HttpMiddleware } from './'
 import type { CypressIncomingRequest } from '../types'
+
 // do not use a debug namespace in this file - use the per-request `this.debug` instead
 // available as cypress-verbose:proxy:http
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
@@ -31,13 +32,29 @@ const ExtractCypressMetadataHeaders: RequestMiddleware = function () {
   const span = telemetry.startSpan({ name: 'extract:cypress:metadata:headers', parentSpan: this.reqMiddlewareSpan, isVerbose })
 
   this.req.isAUTFrame = !!this.req.headers['x-cypress-is-aut-frame']
-
-  span?.setAttributes({
-    isAUTFrame: this.req.isAUTFrame,
-  })
+  this.req.isFromExtraTarget = !!this.req.headers['x-cypress-is-from-extra-target']
 
   if (this.req.headers['x-cypress-is-aut-frame']) {
     delete this.req.headers['x-cypress-is-aut-frame']
+  }
+
+  span?.setAttributes({
+    isAUTFrame: this.req.isAUTFrame,
+    isFromExtraTarget: this.req.isFromExtraTarget,
+  })
+
+  // we only want to intercept requests from the main target and not ones from
+  // extra tabs or windows, so run the bare minimum request/response middleware
+  // to send the request/response directly through
+  if (this.req.isFromExtraTarget) {
+    this.debug('request for [%s %s] is from an extra target', this.req.method, this.req.proxiedUrl)
+
+    delete this.req.headers['x-cypress-is-from-extra-target']
+
+    this.onlyRunMiddleware([
+      'MaybeSetBasicAuthHeaders',
+      'SendRequestOutgoing',
+    ])
   }
 
   span?.end()
@@ -83,13 +100,25 @@ const CorrelateBrowserPreRequest: RequestMiddleware = async function () {
     shouldCorrelatePreRequest: shouldCorrelatePreRequests,
   })
 
-  if (!this.shouldCorrelatePreRequests()) {
+  if (!shouldCorrelatePreRequests) {
     span?.end()
 
     return this.next()
   }
 
+  const onClose = () => {
+    // if we haven't matched a browser pre-request and the request has been destroyed, raise an error
+    if (this.req.destroyed) {
+      span?.end()
+      this.reqMiddlewareSpan?.end()
+
+      this.onError(new Error('request destroyed before browser pre-request was received'))
+    }
+  }
+
   const copyResourceTypeAndNext = () => {
+    this.res.off('close', onClose)
+
     this.req.resourceType = this.req.browserPreRequest?.resourceType
 
     span?.setAttributes({
@@ -127,6 +156,8 @@ const CorrelateBrowserPreRequest: RequestMiddleware = async function () {
     return copyResourceTypeAndNext()
   }
 
+  this.res.once('close', onClose)
+
   this.debug('waiting for prerequest')
   this.pendingRequest = this.getPreRequest((({ browserPreRequest, noPreRequestExpected }) => {
     this.req.browserPreRequest = browserPreRequest
@@ -152,6 +183,24 @@ const CalculateCredentialLevelIfApplicable: RequestMiddleware = function () {
   this.req.resourceType = !this.req.resourceType ? resourceType : this.req.resourceType
   this.req.credentialsLevel = credentialStatus
   this.next()
+}
+
+const FormatCookiesIfApplicable: RequestMiddleware = function () {
+  if (this.req.headers['x-cypress-is-webdriver-bidi'] && this.req.headers.cookie) {
+    const cookies = this.req.headers.cookie
+    // in the case of BiDi, cookies come in as foo=bar;bar=baz and not foo=bar; bar=baz,
+    // i.e. they are delimited differently, which impacts some of our tests and our cookie splicing.
+    // this regex is to help make sure the cookies are fed in consistently
+    const bidiStyleCookie = /;\S/gm
+
+    if (cookies.match(bidiStyleCookie)) {
+      this.req.headers.cookie = cookies.replaceAll(';', '; ')
+    }
+  }
+
+  delete this.req.headers['x-cypress-is-webdriver-bidi']
+
+  return this.next()
 }
 
 const MaybeAttachCrossOriginCookies: RequestMiddleware = function () {
@@ -269,7 +318,7 @@ const MaybeEndRequestWithBufferedResponse: RequestMiddleware = function () {
   })
 
   if (buffer) {
-    this.debug('ending request with buffered response')
+    this.debug('ending request with buffered response', { policyMatch: buffer.urlDoesNotMatchPolicyBasedOnDomain })
 
     // NOTE: Only inject fullCrossOrigin here if the super domain origins do not match in order to keep parity with cypress application reloads
     this.res.wantsInjection = buffer.urlDoesNotMatchPolicyBasedOnDomain ? 'fullCrossOrigin' : 'full'
@@ -299,7 +348,8 @@ const RedirectToClientRouteIfUnloaded: RequestMiddleware = function () {
 
   // if we have an unload header it means our parent app has been navigated away
   // directly and we need to automatically redirect to the clientRoute
-  if (hasAppUnloaded) {
+  // We do not redirect if we are in cypress in cypress since this can be caused by a reload of the internal Cypress app
+  if (hasAppUnloaded && !process.env.CYPRESS_INTERNAL_E2E_TESTING_SELF_PARENT_PROJECT) {
     span?.setAttributes({
       redirectedTo: this.config.clientRoute,
     })
@@ -529,6 +579,7 @@ export default {
   MaybeSimulateSecHeaders,
   CorrelateBrowserPreRequest,
   CalculateCredentialLevelIfApplicable,
+  FormatCookiesIfApplicable,
   MaybeAttachCrossOriginCookies,
   MaybeEndRequestWithBufferedResponse,
   SetMatchingRoutes,

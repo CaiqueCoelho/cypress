@@ -1,5 +1,6 @@
 import { defineConfig } from 'cypress'
 import { initGitRepoForTestProject, resetGitRepoForTestProject } from './cypress/tasks/git'
+import { writeMochaEventSnapshot, readMochaEventSnapshot } from './cypress/tasks/mochaEvents'
 
 export default defineConfig({
   projectId: 'ypt4pf',
@@ -11,6 +12,7 @@ export default defineConfig({
   reporterOptions: {
     configFile: '../../mocha-reporter-config.json',
   },
+  experimentalMemoryManagement: true,
   experimentalCspAllowList: false,
   experimentalInteractiveRunEvents: true,
   component: {
@@ -24,9 +26,13 @@ export default defineConfig({
       framework: 'vue',
     },
   },
+  hosts: {
+    'foobar.com': '127.0.0.1',
+  },
   'e2e': {
     experimentalRunAllSpecs: true,
     experimentalStudio: true,
+    experimentalOriginDependencies: true,
     baseUrl: 'http://localhost:5555',
     supportFile: 'cypress/e2e/support/e2eSupport.ts',
     async setupNodeEvents (on, config) {
@@ -44,6 +50,8 @@ export default defineConfig({
       on('task', {
         initGitRepoForTestProject,
         resetGitRepoForTestProject,
+        writeMochaEventSnapshot,
+        readMochaEventSnapshot,
       })
 
       return await e2ePluginSetup(on, config)

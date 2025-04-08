@@ -14,6 +14,7 @@ const { Automation } = require(`../../../lib/automation`)
 const { BrowserCriClient } = require('../../../lib/browsers/browser-cri-client')
 const electronApp = require('../../../lib/util/electron-app')
 const utils = require('../../../lib/browsers/utils')
+const { screencastOpts } = require('../../../lib/browsers/cdp_automation')
 
 const ELECTRON_PID = 10001
 
@@ -36,7 +37,12 @@ describe('lib/browsers/electron', () => {
       onError: () => {},
     }
 
-    this.automation = new Automation('foo', 'bar', 'baz')
+    this.automation = new Automation({
+      cyNamespace: 'foo',
+      cookieNamespace: 'bar',
+      screenshotsFolder: 'baz',
+    })
+
     this.win = _.extend(new EE(), {
       isDestroyed () {
         return false
@@ -68,18 +74,20 @@ describe('lib/browsers/electron', () => {
     sinon.stub(Windows, 'installExtension').returns()
     sinon.stub(Windows, 'removeAllExtensions').returns()
     sinon.stub(electronApp, 'getRemoteDebuggingPort').resolves(1234)
-    sinon.stub(utils, 'handleDownloadLinksViaCDP').resolves()
+    sinon.stub(utils, 'initializeCDP').resolves()
 
     // mock CRI client during testing
     this.pageCriClient = {
       send: sinon.stub().resolves(),
       on: sinon.stub(),
+      clone: sinon.stub().resolves(),
     }
 
     this.browserCriClient = {
       attachToTargetUrl: sinon.stub().resolves(this.pageCriClient),
       currentlyAttachedTarget: this.pageCriClient,
       close: sinon.stub().resolves(),
+      getWebSocketDebuggerUrl: sinon.stub().returns('ws://debugger'),
     }
 
     sinon.stub(BrowserCriClient, 'create').resolves(this.browserCriClient)
@@ -111,8 +119,11 @@ describe('lib/browsers/electron', () => {
   })
 
   context('.open', () => {
-    beforeEach(function () {
-      return this.stubForOpen()
+    beforeEach(async function () {
+      // shortcut to set the browserCriClient singleton variable
+      await electron._getAutomation({}, { onError: () => {} }, {})
+
+      await this.stubForOpen()
     })
 
     it('calls render with url, state, and options', function () {
@@ -152,7 +163,7 @@ describe('lib/browsers/electron', () => {
       })
     })
 
-    it('is noop when before:browser:launch yields null', function () {
+    it('executeBeforeBrowserLaunch is noop when before:browser:launch yields null', function () {
       plugins.has.returns(true)
       plugins.execute.resolves(null)
 
@@ -207,14 +218,49 @@ describe('lib/browsers/electron', () => {
         expect(Windows.removeAllExtensions).to.be.calledTwice
       })
     })
+
+    it('sends after:browser:launch with debugger url', function () {
+      plugins.has.returns(true)
+      plugins.execute.resolves(null)
+
+      return electron.open('electron', this.url, this.options, this.automation)
+      .then(() => {
+        expect(plugins.execute).to.be.calledWith('after:browser:launch', 'electron', {
+          webSocketDebuggerUrl: 'ws://debugger',
+        })
+      })
+    })
+
+    it('executeAfterBrowserLaunch is noop if after:browser:launch is not registered', function () {
+      return electron.open('electron', this.url, this.options, this.automation)
+      .then(() => {
+        expect(plugins.execute).not.to.be.calledWith('after:browser:launch')
+      })
+    })
   })
 
   context('.connectProtocolToBrowser', () => {
     it('connects to the browser cri client', async function () {
+      const mockCurrentlyAttachedProtocolTarget = {}
+
+      this.browserCriClient.currentlyAttachedProtocolTarget = mockCurrentlyAttachedProtocolTarget
       sinon.stub(electron, '_getBrowserCriClient').returns(this.browserCriClient)
 
       await electron.connectProtocolToBrowser({ protocolManager: this.protocolManager })
-      expect(this.protocolManager.connectToBrowser).to.be.calledWith(this.pageCriClient)
+      expect(this.pageCriClient.clone).not.to.be.called
+      expect(this.protocolManager.connectToBrowser).to.be.calledWith(mockCurrentlyAttachedProtocolTarget)
+    })
+
+    it('connects to the browser cri client when the protocol target has not been created', async function () {
+      const mockCurrentlyAttachedProtocolTarget = {}
+
+      this.pageCriClient.clone.resolves(mockCurrentlyAttachedProtocolTarget)
+      sinon.stub(electron, '_getBrowserCriClient').returns(this.browserCriClient)
+
+      await electron.connectProtocolToBrowser({ protocolManager: this.protocolManager })
+      expect(this.pageCriClient.clone).to.be.called
+      expect(this.protocolManager.connectToBrowser).to.be.calledWith(mockCurrentlyAttachedProtocolTarget)
+      expect(this.browserCriClient.currentlyAttachedProtocolTarget).to.eq(mockCurrentlyAttachedProtocolTarget)
     })
 
     it('throws error if there is no browser cri client', function () {
@@ -231,6 +277,52 @@ describe('lib/browsers/electron', () => {
 
       expect(electron.connectProtocolToBrowser({ protocolManager: this.protocolManager })).to.be.rejectedWith('Missing pageCriClient in connectProtocolToBrowser')
       expect(this.protocolManager.connectToBrowser).not.to.be.called
+    })
+  })
+
+  context('#closeProtocolConnection', () => {
+    it('closes the protocol connection', async function () {
+      const mockCurrentlyAttachedProtocolTarget = {
+        close: sinon.stub().resolves(),
+      }
+
+      const browserCriClient = {
+        currentlyAttachedProtocolTarget: mockCurrentlyAttachedProtocolTarget,
+      }
+
+      sinon.stub(electron, '_getBrowserCriClient').returns(browserCriClient)
+
+      await electron.closeProtocolConnection()
+
+      expect(mockCurrentlyAttachedProtocolTarget.close).to.be.called
+      expect(browserCriClient.currentlyAttachedProtocolTarget).to.be.undefined
+    })
+  })
+
+  context('.kill', () => {
+    beforeEach(async function () {
+      await electron._getAutomation({}, { onError: () => {} }, {})
+
+      await this.stubForOpen()
+
+      sinon.stub(electron, '_getBrowserCriClient').returns(this.browserCriClient)
+    })
+
+    it('does not terminate the browserCriClient if the instance is an orphaned process', async function () {
+      const instance = await electron.open('electron', this.url, this.options, this.automation)
+
+      instance.isOrphanedBrowserProcess = true
+      instance.kill()
+
+      expect(this.browserCriClient.close).not.to.be.called
+    })
+
+    it('terminates the browserCriClient otherwise', async function () {
+      const instance = await electron.open('electron', this.url, this.options, this.automation)
+
+      instance.kill()
+
+      expect(this.browserCriClient.close).to.be.called
     })
   })
 
@@ -322,7 +414,7 @@ describe('lib/browsers/electron', () => {
         getFilename: () => 'file.csv',
         getMimeType: () => 'text/csv',
         getURL: () => 'http://localhost:1234/file.csv',
-        once: sinon.stub().yields(),
+        once: sinon.stub().yields({}, 'completed'),
       }
 
       this.win.webContents.session.on.withArgs('will-download').yields({}, downloadItem)
@@ -332,6 +424,27 @@ describe('lib/browsers/electron', () => {
       return electron._launch(this.win, this.url, this.automation, this.options, undefined, undefined, { attachCDPClient: sinon.stub() })
       .then(() => {
         expect(this.automation.push).to.be.calledWith('complete:download', {
+          id: '1',
+        })
+      })
+    })
+
+    it('pushes canceled:download when download is incomplete', function () {
+      const downloadItem = {
+        getETag: () => '1',
+        getFilename: () => 'file.csv',
+        getMimeType: () => 'text/csv',
+        getURL: () => 'http://localhost:1234/file.csv',
+        once: sinon.stub().yields({}, 'canceled'),
+      }
+
+      this.win.webContents.session.on.withArgs('will-download').yields({}, downloadItem)
+      this.options.downloadsFolder = 'downloads'
+      sinon.stub(this.automation, 'push')
+
+      return electron._launch(this.win, this.url, this.automation, this.options, undefined, undefined, { attachCDPClient: sinon.stub() })
+      .then(() => {
+        expect(this.automation.push).to.be.calledWith('canceled:download', {
           id: '1',
         })
       })
@@ -352,7 +465,7 @@ describe('lib/browsers/electron', () => {
     it('handles download links via cdp', function () {
       return electron._launch(this.win, this.url, this.automation, this.options, undefined, undefined, { attachCDPClient: sinon.stub() })
       .then(() => {
-        expect(utils.handleDownloadLinksViaCDP).to.be.calledWith(this.pageCriClient, this.automation)
+        expect(utils.initializeCDP).to.be.calledWith(this.pageCriClient, this.automation)
       })
     })
 
@@ -362,6 +475,41 @@ describe('lib/browsers/electron', () => {
         expect(this.pageCriClient.send).to.be.calledWith('Storage.clearDataForOrigin', { origin: '*', storageTypes: 'all' })
         expect(this.pageCriClient.send).to.be.calledWith('Network.clearBrowserCache')
       })
+    })
+
+    it('expects the video to be fully enabled if specified in the config', async function () {
+      const mockWriteVideoFrame = sinon.stub()
+      const mockVideoApi = {
+        useFfmpegVideoController: sinon.stub().resolves({
+          writeVideoFrame: mockWriteVideoFrame,
+        }),
+      }
+
+      await electron._launch(this.win, this.url, this.automation, this.options, mockVideoApi, undefined, { attachCDPClient: sinon.stub() })
+
+      expect(mockVideoApi.useFfmpegVideoController).to.be.called
+      expect(this.pageCriClient.on).to.be.calledWith('Page.screencastFrame', sinon.match.func)
+      expect(this.pageCriClient.send).to.be.calledWith('Page.startScreencast', screencastOpts())
+    })
+
+    it('starts the screencast but does not capture the frames if video is not enabled but the app is in run mode', async function () {
+      this.options.isTextTerminal = true
+
+      await electron._launch(this.win, this.url, this.automation, this.options, undefined, undefined, { attachCDPClient: sinon.stub() })
+
+      expect(this.pageCriClient.on).not.to.be.calledWith('Page.screencastFrame', sinon.match.func)
+      expect(this.pageCriClient.send).to.be.calledWith('Page.startScreencast', {
+        format: 'jpeg',
+        everyNthFrame: 2 ** 31 - 1,
+        quality: 0,
+      })
+    })
+
+    it('does not start the screencast if video is not enabled and the app is not in run mode', async function () {
+      await electron._launch(this.win, this.url, this.automation, this.options, undefined, undefined, { attachCDPClient: sinon.stub() })
+
+      expect(this.pageCriClient.on).not.to.be.calledWith('Page.screencastFrame', sinon.match.func)
+      expect(this.pageCriClient.send).not.to.be.calledWith('Page.startScreencast', sinon.match.any)
     })
 
     it('registers onRequest automation middleware and calls show when requesting to be focused', function () {
@@ -386,7 +534,7 @@ describe('lib/browsers/electron', () => {
         expect(this.automation.use).to.be.called
         expect(this.automation.use.lastCall.args[0].onRequest).to.be.a('function')
 
-        await this.automation.use.lastCall.args[0].onRequest('reset:browser:tabs:for:next:test', { shouldKeepTabOpen: true })
+        await this.automation.use.lastCall.args[0].onRequest('reset:browser:tabs:for:next:spec', { shouldKeepTabOpen: true })
 
         expect(this.win.destroy).to.be.called
       })
@@ -505,9 +653,13 @@ describe('lib/browsers/electron', () => {
       })
 
       it('connects the protocol manager to the browser', async function () {
+        const mockCurrentlyAttachedProtocolTarget = {}
+
+        this.pageCriClient.clone.resolves(mockCurrentlyAttachedProtocolTarget)
+
         await electron._launch(this.win, this.url, this.automation, this.options, undefined, this.protocolManager, { attachCDPClient: sinon.stub() })
 
-        expect(this.protocolManager.connectToBrowser).to.be.calledWith(this.pageCriClient)
+        expect(this.protocolManager.connectToBrowser).to.be.calledWith(mockCurrentlyAttachedProtocolTarget)
       })
     })
   })
@@ -800,7 +952,10 @@ describe('lib/browsers/electron', () => {
         expect(electron._launchChild).to.be.calledWith(this.url, parentWindow, this.options.projectRoot, this.state, this.options, this.automation)
       })
 
-      it('adds pid of new BrowserWindow to allPids list', function () {
+      it('adds pid of new BrowserWindow to allPids list', async function () {
+        // shortcut to set the browserCriClient singleton variable
+        await electron._getAutomation({}, { onError: () => {} }, {})
+
         const opts = electron._defaultOptions(this.options.projectRoot, this.state, this.options)
 
         const NEW_WINDOW_PID = ELECTRON_PID * 2

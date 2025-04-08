@@ -125,6 +125,10 @@ class RunPlugins {
       if (!this.registeredEventsByName['file:preprocessor']) {
         debug('register default preprocessor')
         registerChildEvent('file:preprocessor', this._getDefaultPreprocessor(initialConfig))
+      } else {
+        const handler = this.registeredEventsById[this.registeredEventsByName['file:preprocessor']].handler
+
+        this.ipc.send('file:preprocessor:overridden', { handlerText: handler.toString() })
       }
     })
     .then((modifiedCfg) => {
@@ -169,7 +173,9 @@ class RunPlugins {
       case '_get:task:body':
         return this.taskGetBody(ids, args)
       case 'before:browser:launch':
-        return browserLaunch.wrap(this.ipc, this.invoke, ids, args)
+        return browserLaunch.wrapBefore(this.ipc, this.invoke, ids, args)
+      case 'after:browser:launch':
+        return util.wrapChildPromise(this.ipc, this.invoke, ids, args)
       default:
         debug('unexpected execute message:', event, args)
 

@@ -33,6 +33,7 @@ describe('lib/browsers/chrome', () => {
         attachToTargetUrl: sinon.stub().resolves(this.pageCriClient),
         close: sinon.stub().resolves(),
         ensureMinimumProtocolVersion: sinon.stub().withArgs('1.3').resolves(),
+        getWebSocketDebuggerUrl: sinon.stub().returns('ws://debugger'),
       }
 
       this.automation = {
@@ -60,7 +61,7 @@ describe('lib/browsers/chrome', () => {
       sinon.stub(launch, 'launch').resolves(this.launchedBrowser)
       sinon.stub(utils, 'getProfileDir').returns('/profile/dir')
       sinon.stub(utils, 'ensureCleanCache').resolves('/profile/dir/CypressCache')
-      sinon.stub(utils, 'handleDownloadLinksViaCDP').resolves()
+      sinon.stub(utils, 'initializeCDP').resolves()
 
       this.readJson = sinon.stub(fs, 'readJson')
       this.readJson.withArgs('/profile/dir/Default/Preferences').rejects({ code: 'ENOENT' })
@@ -81,26 +82,27 @@ describe('lib/browsers/chrome', () => {
       .then(() => {
         expect(utils.getPort).to.have.been.calledOnce // to get remote interface port
 
-        expect(this.pageCriClient.send.callCount).to.equal(6)
+        expect(this.pageCriClient.send.callCount).to.equal(7)
         expect(this.pageCriClient.send).to.have.been.calledWith('Page.bringToFront')
         expect(this.pageCriClient.send).to.have.been.calledWith('Page.navigate')
         expect(this.pageCriClient.send).to.have.been.calledWith('Page.enable')
         expect(this.pageCriClient.send).to.have.been.calledWith('Page.setDownloadBehavior')
         expect(this.pageCriClient.send).to.have.been.calledWith('Network.enable')
         expect(this.pageCriClient.send).to.have.been.calledWith('Fetch.enable')
+        expect(this.pageCriClient.send).to.have.been.calledWith('ServiceWorker.enable')
 
-        expect(utils.handleDownloadLinksViaCDP).to.be.calledOnce
+        expect(utils.initializeCDP).to.be.calledOnce
       })
     })
 
-    it('is noop without before:browser:launch', function () {
+    it('executeBeforeBrowserLaunch is noop if before:browser:launch is not registered', function () {
       return chrome.open({ isHeadless: true }, 'http://', openOpts, this.automation)
       .then(() => {
-        expect(plugins.execute).not.to.be.called
+        expect(plugins.execute).not.to.be.calledWith('before:browser:launch')
       })
     })
 
-    it('is noop if newArgs are not returned', function () {
+    it('uses default args if new args are not returned from before:browser:launch', function () {
       const args = []
 
       sinon.stub(chrome, '_getArgs').returns(args)
@@ -190,27 +192,35 @@ describe('lib/browsers/chrome', () => {
       })
     })
 
-    it('DEPRECATED: normalizes --load-extension if provided in plugin', function () {
-      plugins.registerEvent('before:browser:launch', (browser, config) => {
-        return Promise.resolve(['--foo=bar', '--load-extension=/foo/bar/baz.js'])
+    context('when IGNORE_CHROME_PREFERENCES env is set', () => {
+      let oldPref
+      let writeJson
+
+      beforeEach(function () {
+        oldPref = process.env.IGNORE_CHROME_PREFERENCES
+        process.env.IGNORE_CHROME_PREFERENCES = true
+        this.readJson.rejects({ code: 'ENOENT' })
+        writeJson = sinon.stub(fs, 'outputJson').resolves()
       })
 
-      const pathToTheme = extension.getPathToTheme()
+      afterEach(() => {
+        process.env.IGNORE_CHROME_PREFERENCES = oldPref
+        writeJson.restore()
+      })
 
-      const onWarning = sinon.stub()
+      it('does not read or write preferences', async function () {
+        chrome._writeExtension.restore()
+        utils.getProfileDir.restore()
 
-      return chrome.open({ isHeaded: true }, 'http://', { onWarning, onError: () => {} }, this.automation)
-      .then(() => {
-        const args = launch.launch.firstCall.args[3]
+        await chrome.open({
+          isHeadless: true,
+          isHeaded: false,
+          name: 'chromium',
+          channel: 'stable',
+        }, 'http://', openOpts, this.automation)
 
-        expect(args).to.deep.eq([
-          '--foo=bar',
-          `--load-extension=/foo/bar/baz.js,/path/to/ext,${pathToTheme}`,
-          '--user-data-dir=/profile/dir',
-          '--disk-cache-dir=/profile/dir/CypressCache',
-        ])
-
-        expect(onWarning).calledOnce
+        expect(writeJson).not.to.be.called
+        expect(this.readJson).not.to.be.called
       })
     })
 
@@ -304,6 +314,30 @@ describe('lib/browsers/chrome', () => {
       return expect(chrome.open({ isHeadless: true }, 'http://', openOpts, this.automation)).to.be.rejectedWith('Cypress requires at least Chrome 64.')
     })
 
+    it('sends after:browser:launch with debugger url', function () {
+      const args = []
+      const browser = { isHeadless: true }
+
+      sinon.stub(chrome, '_getArgs').returns(args)
+      sinon.stub(plugins, 'has').returns(true)
+
+      plugins.execute.resolves(null)
+
+      return chrome.open(browser, 'http://', openOpts, this.automation)
+      .then(() => {
+        expect(plugins.execute).to.be.calledWith('after:browser:launch', browser, {
+          webSocketDebuggerUrl: 'ws://debugger',
+        })
+      })
+    })
+
+    it('executeAfterBrowserLaunch is noop if after:browser:launch is not registered', function () {
+      return chrome.open({ isHeadless: true }, 'http://', openOpts, this.automation)
+      .then(() => {
+        expect(plugins.execute).not.to.be.calledWith('after:browser:launch')
+      })
+    })
+
     describe('downloads', function () {
       it('pushes create:download after download begins', function () {
         const downloadData = {
@@ -334,6 +368,21 @@ describe('lib/browsers/chrome', () => {
         return this.onCriEvent('Page.downloadProgress', downloadData, options)
         .then(() => {
           expect(this.automation.push).to.be.calledWith('complete:download', {
+            id: '1',
+          })
+        })
+      })
+
+      it('pushes canceled:download when download is incomplete', function () {
+        const downloadData = {
+          guid: '1',
+          state: 'canceled',
+        }
+        const options = { downloadsFolder: 'downloads' }
+
+        return this.onCriEvent('Page.downloadProgress', downloadData, options)
+        .then(() => {
+          expect(this.automation.push).to.be.calledWith('canceled:download', {
             id: '1',
           })
         })
@@ -466,12 +515,15 @@ describe('lib/browsers/chrome', () => {
         targetId: '1234',
       }
 
+      const mockCurrentlyAttachedProtocolTarget = {}
+
       const cdpSocketServer = {
         attachCDPClient: sinon.stub(),
       }
 
       const browserCriClient = {
         currentlyAttachedTarget: pageCriClient,
+        currentlyAttachedProtocolTarget: mockCurrentlyAttachedProtocolTarget,
         host: 'http://localhost',
         port: 1234,
       }
@@ -507,7 +559,7 @@ describe('lib/browsers/chrome', () => {
       expect(chrome._handleDownloads).to.be.called
       expect(onInitializeNewBrowserTabCalled).to.be.true
       expect(cdpSocketServer.attachCDPClient).to.be.calledWith(pageCriClient)
-      expect(protocolManager.connectToBrowser).to.be.calledWith(pageCriClient)
+      expect(protocolManager.connectToBrowser).to.be.calledWith(mockCurrentlyAttachedProtocolTarget)
     })
   })
 
@@ -517,7 +569,35 @@ describe('lib/browsers/chrome', () => {
         connectToBrowser: sinon.stub().resolves(),
       }
 
-      const pageCriClient = sinon.stub()
+      const mockCurrentlyAttachedProtocolTarget = {}
+
+      const pageCriClient = {
+        clone: sinon.stub().returns(mockCurrentlyAttachedProtocolTarget),
+      }
+
+      const browserCriClient = {
+        currentlyAttachedTarget: pageCriClient,
+        currentlyAttachedProtocolTarget: mockCurrentlyAttachedProtocolTarget,
+      }
+
+      sinon.stub(chrome, '_getBrowserCriClient').returns(browserCriClient)
+
+      await chrome.connectProtocolToBrowser({ protocolManager })
+
+      expect(pageCriClient.clone).not.to.be.called
+      expect(protocolManager.connectToBrowser).to.be.calledWith(mockCurrentlyAttachedProtocolTarget)
+    })
+
+    it('connects to the browser cri client when the protocol target has not been created', async function () {
+      const protocolManager = {
+        connectToBrowser: sinon.stub().resolves(),
+      }
+
+      const mockCurrentlyAttachedProtocolTarget = {}
+
+      const pageCriClient = {
+        clone: sinon.stub().resolves(mockCurrentlyAttachedProtocolTarget),
+      }
 
       const browserCriClient = {
         currentlyAttachedTarget: pageCriClient,
@@ -527,7 +607,9 @@ describe('lib/browsers/chrome', () => {
 
       await chrome.connectProtocolToBrowser({ protocolManager })
 
-      expect(protocolManager.connectToBrowser).to.be.calledWith(pageCriClient)
+      expect(pageCriClient.clone).to.be.called
+      expect(protocolManager.connectToBrowser).to.be.calledWith(mockCurrentlyAttachedProtocolTarget)
+      expect(browserCriClient.currentlyAttachedProtocolTarget).to.eq(mockCurrentlyAttachedProtocolTarget)
     })
 
     it('throws error if there is no browser cri client', function () {
@@ -554,6 +636,25 @@ describe('lib/browsers/chrome', () => {
 
       expect(chrome.connectProtocolToBrowser({ protocolManager })).to.be.rejectedWith('Missing pageCriClient in connectProtocolToBrowser')
       expect(protocolManager.connectToBrowser).not.to.be.called
+    })
+  })
+
+  context('#closeProtocolConnection', () => {
+    it('closes the protocol connection', async function () {
+      const mockCurrentlyAttachedProtocolTarget = {
+        close: sinon.stub().resolves(),
+      }
+
+      const browserCriClient = {
+        currentlyAttachedProtocolTarget: mockCurrentlyAttachedProtocolTarget,
+      }
+
+      sinon.stub(chrome, '_getBrowserCriClient').returns(browserCriClient)
+
+      await chrome.closeProtocolConnection()
+
+      expect(mockCurrentlyAttachedProtocolTarget.close).to.be.called
+      expect(browserCriClient.currentlyAttachedProtocolTarget).to.be.undefined
     })
   })
 
